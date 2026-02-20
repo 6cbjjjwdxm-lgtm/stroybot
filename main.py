@@ -37,6 +37,9 @@ from openai import OpenAI
 # 1. Загружаем настройки
 load_dotenv()
 
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -127,8 +130,8 @@ GROUPS_CONFIG = {
 
 REKLAMACIA_CHAT_ID = -5044901573  # чат "Рекламация 2025"
 
-DEADLINES_FILE = "deadlines.json"
-PROGRESS_STATE_FILE = "progress_state.json"
+DEADLINES_FILE = os.path.join(DATA_DIR, "deadlines.json")
+PROGRESS_STATE_FILE = os.path.join(DATA_DIR, "progress_state.json")
 pending_photos = {}
 pending_progress = {}
 pending_deadline_setup = {}
@@ -275,7 +278,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def save_file_to_system(local_path, address, system, filename):
-    base_folder = "StroyBot_Files"
+    base_folder = os.path.join(DATA_DIR, "StroyBot_Files")
     address_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in address])
     system_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in system])
     path = os.path.join(base_folder, address_clean.strip(), system_clean.strip())
@@ -300,7 +303,7 @@ def build_progress_keyboard(min_value: int):
     return InlineKeyboardMarkup(rows)
 
 def create_or_update_progress_excel(address, date_str, data):
-    base_folder = "StroyBot_Files"
+    base_folder = os.path.join(DATA_DIR, "StroyBot_Files")
     address_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in address])
     path = os.path.join(base_folder, address_clean.strip())
     if not os.path.exists(path): os.makedirs(path)

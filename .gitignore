@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+StroyBot_Files/
+*.xlsx
+deadlines.json
+progress_state.json

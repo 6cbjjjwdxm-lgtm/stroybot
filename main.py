@@ -278,7 +278,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def save_file_to_system(local_path, address, system, filename):
-    base_folder = os.path.join(DATA_DIR, "StroyBot_Files")
+    base_folder = DATA_DIR
     address_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in address])
     system_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in system])
     path = os.path.join(base_folder, address_clean.strip(), system_clean.strip())
@@ -303,7 +303,7 @@ def build_progress_keyboard(min_value: int):
     return InlineKeyboardMarkup(rows)
 
 def create_or_update_progress_excel(address, date_str, data):
-    base_folder = os.path.join(DATA_DIR, "StroyBot_Files")
+    base_folder = DATA_DIR
     address_clean = "".join([c if c.isalnum() or c in '._- ' else "_" for c in address])
     path = os.path.join(base_folder, address_clean.strip())
     if not os.path.exists(path): os.makedirs(path)

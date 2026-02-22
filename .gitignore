@@ -4,7 +4,11 @@ venv/
 __pycache__/
 *.pyc
 
+# данные на Render Disk
 StroyBot_Files/
 *.xlsx
 deadlines.json
 progress_state.json
+
+# временные
+*.tmp

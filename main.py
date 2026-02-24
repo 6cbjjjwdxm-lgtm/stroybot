@@ -915,7 +915,7 @@ async def ask_for_system_progress(context: ContextTypes.DEFAULT_TYPE):
             cid,
             text,
             parse_mode="HTML",
-            reply_markup=build_progress_keyboard(int(prev_val))),
+            reply_markup=build_progress_keyboard(int(prev_val)),
         )
 
 

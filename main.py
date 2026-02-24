@@ -51,10 +51,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# гасим INFO-логи httpx, чтобы не светить токен в URL
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 # -------------------- SECRETS --------------------
@@ -93,17 +91,7 @@ GROUPS_CONFIG = {
     "Краснопахорский Шишкин Лес 23": {"chat_id": -5223853098, "systems": ["Ремонт фасада", "Ремонт Крыши"]},
     "Рогово Школьная 20": {
         "chat_id": -5110229686,
-        "systems": [
-            "ГВС маг",
-            "ХВС маг",
-            "ЦО маг",
-            "КН маг",
-            "ГВС ст",
-            "ХВС ст",
-            "ЦО ст",
-            "КН st",
-            "Ремонт подвала",
-        ],
+        "systems": ["ГВС маг", "ХВС маг", "ЦО маг", "КН маг", "ГВС ст", "ХВС ст", "ЦО ст", "КН ст", "Ремонт подвала"],
     },
     "Рогово Юбилейная 16": {
         "chat_id": -5218573114,
@@ -356,6 +344,35 @@ def create_or_update_progress_excel(address: str, date_str: str, data: dict):
         ws.append([date_str, sys, val])
 
     wb.save(xlsx)
+
+
+def _get_project_name_by_chat(chat_id: int, chat_title: str | None) -> str | None:
+    for p_name, cfg in GROUPS_CONFIG.items():
+        if cfg["chat_id"] == chat_id:
+            return p_name
+    if chat_title and chat_title in GROUPS_CONFIG:
+        return chat_title
+    return None
+
+
+async def _reindex_project_background(bot, chat_id: int, project_name: str):
+    """
+    Фоновая переиндексация: тяжелая CPU/IO работа уходит в отдельный поток,
+    чтобы не блокировать event loop бота. [web:698]
+    """
+    try:
+        await bot.send_message(chat_id=chat_id, text=f"🔄 Обновляю базу знаний по объекту: {project_name} ...")
+        ok = await asyncio.to_thread(rag_engine.build_index_for_project, project_name)
+        if ok:
+            await bot.send_message(chat_id=chat_id, text="✅ Индексация завершена.")
+        else:
+            await bot.send_message(chat_id=chat_id, text="⚠️ Индексация не выполнена (PDF не найдены или ошибка чтения).")
+    except Exception as e:
+        logger.error(f"Reindex error for {project_name}: {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка индексации: {e}")
+        except Exception:
+            pass
 
 
 # -------------------- AI --------------------
@@ -663,17 +680,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_query = text[1:].strip()
         await update.message.chat.send_action("typing")
 
-        project_name = None
-        for p_name, cfg in GROUPS_CONFIG.items():
-            if cfg["chat_id"] == cid:
-                project_name = p_name
-                break
-        if not project_name and title in GROUPS_CONFIG:
-            project_name = title
-
-        context_data = None
-        if project_name:
-            context_data = rag_engine.get_relevant_context(project_name, user_query)
+        project_name = _get_project_name_by_chat(cid, title)
+        context_data = rag_engine.get_relevant_context(project_name, user_query) if project_name else None
 
         res = await get_gpt_response(user_query, context=context_data)
 
@@ -690,7 +698,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# -------------------- DOCS REINDEX --------------------
+# -------------------- DOCS REINDEX (manual) --------------------
 async def reload_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update):
         return
@@ -699,7 +707,8 @@ async def reload_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     count = 0
 
     for project_name in GROUPS_CONFIG.keys():
-        if rag_engine.build_index_for_project(project_name):
+        ok = await asyncio.to_thread(rag_engine.build_index_for_project, project_name)
+        if ok:
             count += 1
 
     await context.bot.edit_message_text(
@@ -722,7 +731,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
-    # Vision: caption начинается с "*"
     if caption.strip().startswith("*") and msg.photo:
         file_obj = await context.bot.get_file(msg.photo[-1].file_id)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -733,7 +741,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(ai_answer)
         return
 
-    # Сохранение фото/файла в DATA_DIR
     target_cfg = None
     for _, cfg in GROUPS_CONFIG.items():
         if cfg["chat_id"] == chat_id:
@@ -774,7 +781,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "config": target_cfg,
     }
 
-    # добавляем общую папку проекта как первый пункт
     systems = [COMMON_DOCS_BUTTON] + target_cfg["systems"]
     keyboard = [[InlineKeyboardButton(s, callback_data=f"save_{chat_id}_{message_id}_{i}")] for i, s in enumerate(systems)]
     await msg.reply_text("🔧 К какой папке сохранить файл?", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -801,7 +807,7 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
     dest_path = save_file_to_system(d["local_path"], d["chat_title"], folder_name, d["filename"])
 
     await query.edit_message_text(
-        f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>",
+        f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>\n\n🔄 Запускаю переиндексацию…",
         parse_mode="HTML",
     )
 
@@ -812,6 +818,12 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"Не удалось удалить временный файл: {e}")
 
     del pending_photos[key]
+
+    # автоиндексация только если это PDF
+    if str(dest_path).lower().endswith(".pdf"):
+        project_name = _get_project_name_by_chat(chat_id, d.get("chat_title"))
+        if project_name:
+            asyncio.create_task(_reindex_project_background(context.bot, chat_id, project_name))
 
 
 # -------------------- JOBS --------------------

@@ -9,7 +9,6 @@ import pytz
 
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
-from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
@@ -44,7 +43,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DEADLINES_FILE = os.path.join(DATA_DIR, "deadlines.json")
 PROGRESS_STATE_FILE = os.path.join(DATA_DIR, "progress_state.json")
 
-# где храним папки проектов (PDF/фото/файлы)
 PROJECTS_DIR = os.path.join(DATA_DIR, "StroyBot_Files")
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 
@@ -53,6 +51,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# гасим INFO-логи httpx, чтобы не светить токен в URL
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # -------------------- SECRETS --------------------
@@ -67,7 +69,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------- CONFIG --------------------
-ADMIN_USER_IDS = {459980503, 5130953211, 1229215603}  # проверь актуальность
+ADMIN_USER_IDS = {459980503, 5130953211, 1229215603}
 
 GROUPS_CONFIG = {
     "Мосрентген 28": {
@@ -99,7 +101,7 @@ GROUPS_CONFIG = {
             "ГВС ст",
             "ХВС ст",
             "ЦО ст",
-            "КН ст",
+            "КН st",
             "Ремонт подвала",
         ],
     },
@@ -130,6 +132,9 @@ GROUPS_CONFIG = {
 }
 
 REKLAMACIA_CHAT_ID = -5044901573
+
+COMMON_DOCS_BUTTON = "📁 Общие документы"
+COMMON_DOCS_FOLDER = "_PROJECT"
 
 SYSTEM_PROMPT = """
 Ты — главный инженер и технический эксперт по капитальному ремонту многоквартирных домов (МКД) в Москве.
@@ -194,7 +199,7 @@ def get_deadlines_report(chat_id: int, show_all: bool = False) -> str:
 
     report_lines = []
     today = datetime.now()
-    weekday = today.weekday()  # 0=Пн, 4=Пт
+    weekday = today.weekday()
 
     def _key(item):
         try:
@@ -522,7 +527,6 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ У вас нет прав на рассылку.")
         return
 
-    context.user_data["bc_mode"] = True
     context.user_data["bc_selected"] = set()
     context.user_data["bc_wait_message"] = False
 
@@ -655,7 +659,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Формат ДД.ММ.ГГГГ")
         return
 
-    # AI по документации: сообщение начинается с "*"
     if text.startswith("*"):
         user_query = text[1:].strip()
         await update.message.chat.send_action("typing")
@@ -727,8 +730,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file_obj.download_to_drive(local_path)
             await msg.chat.send_action("typing")
             ai_answer = await get_vision_response(caption.replace("*", "").strip(), local_path)
-
-            # безопасно: без parse_mode
             await msg.reply_text(ai_answer)
         return
 
@@ -757,8 +758,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_ext = ext or ".bin"
         else:
             file_ext = ".bin"
-
-    if not file_obj:
+    else:
         return
 
     temp_dir = tempfile.gettempdir()
@@ -774,9 +774,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "config": target_cfg,
     }
 
-    systems = target_cfg["systems"]
+    # добавляем общую папку проекта как первый пункт
+    systems = [COMMON_DOCS_BUTTON] + target_cfg["systems"]
     keyboard = [[InlineKeyboardButton(s, callback_data=f"save_{chat_id}_{message_id}_{i}")] for i, s in enumerate(systems)]
-    await msg.reply_text("🔧 К какой системе относится файл?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg.reply_text("🔧 К какой папке сохранить файл?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,10 +793,17 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     d = pending_photos[key]
-    sys_name = d["config"]["systems"][sys_idx]
-    dest_path = save_file_to_system(d["local_path"], d["chat_title"], sys_name, d["filename"])
 
-    await query.edit_message_text(f"✅ Файл сохранён:\n<b>{sys_name}</b>\n<code>{dest_path}</code>", parse_mode="HTML")
+    systems = [COMMON_DOCS_BUTTON] + d["config"]["systems"]
+    chosen = systems[sys_idx]
+    folder_name = COMMON_DOCS_FOLDER if chosen == COMMON_DOCS_BUTTON else chosen
+
+    dest_path = save_file_to_system(d["local_path"], d["chat_title"], folder_name, d["filename"])
+
+    await query.edit_message_text(
+        f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>",
+        parse_mode="HTML",
+    )
 
     if os.path.exists(d["local_path"]):
         try:
@@ -877,7 +885,6 @@ def _setup_jobs(app):
     msk_tz = pytz.timezone("Europe/Moscow")
     trigger = CronTrigger(day_of_week="tue,fri", hour=15, minute=0, second=0, timezone=msk_tz)
 
-    # job_kwargs должен быть dict с trigger, так делает JobQueue.run_custom [web:560]
     app.job_queue.run_custom(
         ask_for_system_progress,
         job_kwargs={"trigger": trigger},
@@ -889,7 +896,6 @@ def main():
     logger.info("🚀 БОТ ЗАПУЩЕН...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # важный момент: скажем rag_engine где лежат PDF
     rag_engine.configure(data_dir=DATA_DIR)
 
     app.add_handler(CommandHandler("start", start))
@@ -915,5 +921,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

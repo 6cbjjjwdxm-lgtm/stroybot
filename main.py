@@ -51,8 +51,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# не светим токен в URL и лишние HTTP логи
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # -------------------- SECRETS --------------------
@@ -123,6 +125,11 @@ REKLAMACIA_CHAT_ID = -5044901573
 
 COMMON_DOCS_BUTTON = "📁 Общие документы"
 COMMON_DOCS_FOLDER = "_PROJECT"
+
+# Индексация: дебаунс + lock (чтобы не убивать 512MB RAM)
+REINDEX_DEBOUNCE_SECONDS = 60
+reindex_locks = {}
+reindex_tasks = {}
 
 SYSTEM_PROMPT = """
 Ты — главный инженер и технический эксперт по капитальному ремонту многоквартирных домов (МКД) в Москве.
@@ -355,24 +362,40 @@ def _get_project_name_by_chat(chat_id: int, chat_title: str | None) -> str | Non
     return None
 
 
-async def _reindex_project_background(bot, chat_id: int, project_name: str):
+async def schedule_reindex(bot, chat_id: int, project_name: str):
     """
-    Фоновая переиндексация: тяжелая CPU/IO работа уходит в отдельный поток,
-    чтобы не блокировать event loop бота. [web:698]
+    Правильная автоиндексация:
+    - debounce: индексируем раз в N секунд после последней загрузки PDF
+    - lock: никогда не индексируем один проект параллельно
+    - build_index_for_project сохраняет индекс на диск (rag_engine.py)
     """
-    try:
-        await bot.send_message(chat_id=chat_id, text=f"🔄 Обновляю базу знаний по объекту: {project_name} ...")
-        ok = await asyncio.to_thread(rag_engine.build_index_for_project, project_name)
-        if ok:
-            await bot.send_message(chat_id=chat_id, text="✅ Индексация завершена.")
-        else:
-            await bot.send_message(chat_id=chat_id, text="⚠️ Индексация не выполнена (PDF не найдены или ошибка чтения).")
-    except Exception as e:
-        logger.error(f"Reindex error for {project_name}: {e}")
+    lock = reindex_locks.setdefault(project_name, asyncio.Lock())
+
+    old = reindex_tasks.get(project_name)
+    if old and not old.done():
+        old.cancel()
+
+    async def _runner():
         try:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка индексации: {e}")
-        except Exception:
-            pass
+            await asyncio.sleep(REINDEX_DEBOUNCE_SECONDS)
+
+            if lock.locked():
+                return
+
+            async with lock:
+                await bot.send_message(chat_id=chat_id, text=f"🔄 Индексация: {project_name} (подождите)…")
+                ok = await asyncio.to_thread(rag_engine.build_index_for_project, project_name)
+                if ok:
+                    await bot.send_message(chat_id=chat_id, text="✅ Индексация завершена и сохранена на диск.")
+                else:
+                    await bot.send_message(chat_id=chat_id, text="⚠️ Индексация не выполнена (нет PDF или ошибка).")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error(f"Reindex error for {project_name}: {e}")
+
+    task = asyncio.create_task(_runner())
+    reindex_tasks[project_name] = task
 
 
 # -------------------- AI --------------------
@@ -464,7 +487,11 @@ async def start_deadline_setup(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_deadline_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
     cid = update.effective_chat.id
     idx = int(q.data.split("_")[1])
 
@@ -485,17 +512,22 @@ async def show_deadlines_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_progress_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
     cid = update.effective_chat.id
     if cid not in pending_progress:
-        await q.edit_message_text("❌ Опрос прогресса не активен. Дождитесь следующего запуска.")
+        try:
+            await q.edit_message_text("❌ Опрос прогресса не активен. Дождитесь следующего запуска.")
+        except Exception:
+            pass
         return
 
     try:
         new_val = float(q.data.split(":")[1])
     except Exception:
-        await q.answer("❌ Ошибка данных кнопки.", show_alert=True)
         return
 
     st = pending_progress[cid]
@@ -503,7 +535,10 @@ async def handle_progress_button(update: Update, context: ContextTypes.DEFAULT_T
 
     prev_val, prev_date = get_prev_progress(cid, system)
     if new_val < prev_val:
-        await q.answer(f"Нельзя меньше чем было: {prev_val}% (дата {prev_date or '—'})", show_alert=True)
+        try:
+            await q.answer(f"Нельзя меньше чем было: {prev_val}% (дата {prev_date or '—'})", show_alert=True)
+        except Exception:
+            pass
         return
 
     st["ans"][system] = new_val
@@ -518,7 +553,7 @@ async def handle_progress_button(update: Update, context: ContextTypes.DEFAULT_T
             f"Предыдущее: <b>{pv}%</b> (дата: {pd or '—'})\n\n"
             f"👇 Выберите новый процент (не меньше предыдущего):"
         )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=build_progress_keyboard(pv))
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=build_progress_keyboard(int(pv)))
         return
 
     title = update.effective_chat.title or "Личный чат"
@@ -556,7 +591,11 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     data = query.data
 
     if "bc_selected" not in context.user_data:
@@ -583,7 +622,10 @@ async def broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif data == "bc_done":
         if not selected:
-            await query.answer("⚠️ Выберите хотя бы одну группу!", show_alert=True)
+            try:
+                await query.answer("⚠️ Выберите хотя бы одну группу!", show_alert=True)
+            except Exception:
+                pass
             return
         context.user_data["bc_wait_message"] = True
         group_count = len(selected)
@@ -676,6 +718,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Формат ДД.ММ.ГГГГ")
         return
 
+    # RAG: вопрос начинается с "*"
     if text.startswith("*"):
         user_query = text[1:].strip()
         await update.message.chat.send_action("typing")
@@ -731,6 +774,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
+    # Vision: caption начинается с "*"
     if caption.strip().startswith("*") and msg.photo:
         file_obj = await context.bot.get_file(msg.photo[-1].file_id)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -741,6 +785,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(ai_answer)
         return
 
+    # Сохранение файла на диск (persistent)
     target_cfg = None
     for _, cfg in GROUPS_CONFIG.items():
         if cfg["chat_id"] == chat_id:
@@ -779,6 +824,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "filename": filename,
         "chat_title": chat_title,
         "config": target_cfg,
+        "chat_id": chat_id,
     }
 
     systems = [COMMON_DOCS_BUTTON] + target_cfg["systems"]
@@ -788,14 +834,20 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     data = query.data.split("_")
     chat_id, message_id, sys_idx = int(data[1]), int(data[2]), int(data[3])
     key = f"{chat_id}_{message_id}"
 
     if key not in pending_photos:
-        await query.edit_message_text("❌ Файл устарел или уже сохранён.")
+        try:
+            await query.edit_message_text("❌ Файл устарел или уже сохранён.")
+        except Exception:
+            pass
         return
 
     d = pending_photos[key]
@@ -806,11 +858,15 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     dest_path = save_file_to_system(d["local_path"], d["chat_title"], folder_name, d["filename"])
 
-    await query.edit_message_text(
-        f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>\n\n🔄 Запускаю переиндексацию…",
-        parse_mode="HTML",
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
+    # чистим temp
     if os.path.exists(d["local_path"]):
         try:
             os.remove(d["local_path"])
@@ -819,11 +875,11 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     del pending_photos[key]
 
-    # автоиндексация только если это PDF
+    # автоиндексация: только PDF, плюс debounce+lock внутри schedule_reindex
     if str(dest_path).lower().endswith(".pdf"):
         project_name = _get_project_name_by_chat(chat_id, d.get("chat_title"))
         if project_name:
-            asyncio.create_task(_reindex_project_background(context.bot, chat_id, project_name))
+            await schedule_reindex(context.bot, chat_id, project_name)
 
 
 # -------------------- JOBS --------------------
@@ -859,7 +915,7 @@ async def ask_for_system_progress(context: ContextTypes.DEFAULT_TYPE):
             cid,
             text,
             parse_mode="HTML",
-            reply_markup=build_progress_keyboard(prev_val),
+            reply_markup=build_progress_keyboard(int(prev_val))),
         )
 
 
@@ -933,6 +989,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

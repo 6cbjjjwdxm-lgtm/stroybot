@@ -29,10 +29,6 @@ def _clean_name(name: str) -> str:
 
 
 def load_pdfs_from_folder(folder_path: str):
-    """
-    Рекурсивно читает все PDF внутри folder_path (включая подпапки систем и _PROJECT)
-    и возвращает список Document.
-    """
     docs = []
     if not os.path.exists(folder_path):
         return docs
@@ -47,7 +43,6 @@ def load_pdfs_from_folder(folder_path: str):
                 text_parts = []
                 with pdfplumber.open(file_path) as pdf:
                     for page in pdf.pages:
-                        # layout=True полезен для таблиц; если где-то упадёт — поймаем исключение
                         page_text = page.extract_text(layout=True)
                         if page_text:
                             text_parts.append(page_text)
@@ -87,6 +82,9 @@ def build_index_for_project(project_name: str):
 
 
 def get_relevant_context(project_name: str, query: str):
+    if not project_name:
+        return None
+
     if project_name not in VECTOR_STORES:
         index = build_index_for_project(project_name)
         if not index:
@@ -99,4 +97,5 @@ def get_relevant_context(project_name: str, query: str):
         [f"--- ИЗ ДОКУМЕНТА: {doc.metadata.get('source', 'unknown')} ---\n{doc.page_content}" for doc in results]
     )
     return context_text
+
 

@@ -29,31 +29,38 @@ def _clean_name(name: str) -> str:
 
 
 def load_pdfs_from_folder(folder_path: str):
+    """
+    Рекурсивно читает все PDF внутри folder_path (включая подпапки систем и _PROJECT)
+    и возвращает список Document.
+    """
     docs = []
     if not os.path.exists(folder_path):
         return docs
 
-    for filename in os.listdir(folder_path):
-        if not filename.lower().endswith(".pdf"):
-            continue
-
-        file_path = os.path.join(folder_path, filename)
-        try:
-            text_parts = []
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text(layout=True)
-                    if page_text:
-                        text_parts.append(page_text)
-
-            text = "\n".join(text_parts).strip()
-            if not text:
+    for root, _, files in os.walk(folder_path):
+        for filename in files:
+            if not filename.lower().endswith(".pdf"):
                 continue
 
-            docs.append(Document(page_content=text, metadata={"source": filename}))
-            logger.info(f"📄 Загружен файл: {filename}")
-        except Exception as e:
-            logger.error(f"Ошибка чтения {filename}: {e}")
+            file_path = os.path.join(root, filename)
+            try:
+                text_parts = []
+                with pdfplumber.open(file_path) as pdf:
+                    for page in pdf.pages:
+                        # layout=True полезен для таблиц; если где-то упадёт — поймаем исключение
+                        page_text = page.extract_text(layout=True)
+                        if page_text:
+                            text_parts.append(page_text)
+
+                text = "\n".join(text_parts).strip()
+                if not text:
+                    continue
+
+                rel_source = os.path.relpath(file_path, folder_path)
+                docs.append(Document(page_content=text, metadata={"source": rel_source}))
+                logger.info(f"📄 Загружен файл: {rel_source}")
+            except Exception as e:
+                logger.error(f"Ошибка чтения {file_path}: {e}")
 
     return docs
 
@@ -92,3 +99,4 @@ def get_relevant_context(project_name: str, query: str):
         [f"--- ИЗ ДОКУМЕНТА: {doc.metadata.get('source', 'unknown')} ---\n{doc.page_content}" for doc in results]
     )
     return context_text
+

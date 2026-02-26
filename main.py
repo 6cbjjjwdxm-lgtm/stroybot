@@ -6,6 +6,9 @@ import tempfile
 import shutil
 import json
 import pytz
+import sys
+print("SERVICE_STDOUT_TEST", flush=True)
+print("SERVICE_STDERR_TEST", file=sys.stderr, flush=True)
 
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime

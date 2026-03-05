@@ -63,31 +63,29 @@ def iter_pdf_documents(folder_path: str):
                 text_parts = []
                 with pdfplumber.open(file_path) as pdf:
                     for page in pdf.pages:
-                        # layout=True часто лучше для тех.доков, но дороже по CPU/RAM
                         page_text = page.extract_text(layout=True)
                         if page_text:
                             text_parts.append(page_text)
 
-                        # освобождаем кэши pdfplumber, иначе на некоторых PDF память растет
                         try:
                             page.flush_cache()
                         except Exception:
                             pass
                         try:
-                            # cache_clear есть не всегда, но часто помогает
                             page.get_text_layout.cache_clear()
                         except Exception:
                             pass
 
                 text = "\n".join(text_parts).strip()
                 if not text:
+                    logger.warning("PDF без извлекаемого текста (возможно скан): %s", file_path)
                     continue
 
                 rel_source = os.path.relpath(file_path, folder_path)
                 yield Document(page_content=text, metadata={"source": rel_source})
 
             except Exception as e:
-                logger.error(f"Ошибка чтения PDF {file_path}: {e}")
+                logger.error("Ошибка чтения PDF %s: %s", file_path, e)
 
 
 def build_index_for_project(

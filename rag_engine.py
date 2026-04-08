@@ -174,24 +174,40 @@ def load_index_if_exists(project_name: str):
 
 def get_relevant_context(project_name: str, query: str, k: int = 3):
     """
-    Возвращает склейку top-k чанков для промпта.
+    Возвращает (context_str, source_files) где:
+      - context_str — склейка top-k чанков для промпта (или None)
+      - source_files — список полных путей к найденным PDF-файлам
     Если индекс не загружен и нет сохранённого — строит.
     """
     if not project_name:
-        return None
+        return None, []
 
     if project_name not in VECTOR_STORES:
         if not load_index_if_exists(project_name):
             if not build_index_for_project(project_name):
-                return None
+                return None, []
 
     index = VECTOR_STORES[project_name]
     results = index.similarity_search(query, k=k)
     if not results:
-        return None
+        return None, []
 
-    return "\n\n".join(
-        [f"--- ИЗ ДОКУМЕНТА: {doc.metadata.get('source', 'unknown')} ---\n{doc.page_content}" for doc in results]
-    )
+    docs_path = _project_docs_path(project_name)
+    seen_sources: list[str] = []
+    source_files: list[str] = []
+    context_parts: list[str] = []
+
+    for doc in results:
+        source = doc.metadata.get("source", "unknown")
+        context_parts.append(
+            f"--- ИЗ ДОКУМЕНТА: {source} ---\n{doc.page_content}"
+        )
+        if source != "unknown" and source not in seen_sources:
+            seen_sources.append(source)
+            full_path = os.path.join(docs_path, source)
+            if os.path.isfile(full_path):
+                source_files.append(full_path)
+
+    return "\n\n".join(context_parts), source_files
 
 

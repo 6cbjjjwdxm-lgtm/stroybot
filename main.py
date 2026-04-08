@@ -450,6 +450,57 @@ async def get_vision_response(text: str, image_path: str) -> str:
         return f"⚠️ Ошибка: {str(e)}"
 
 
+# -------------------- HELPERS --------------------
+async def _delete_after_delay(bot, chat_id: int, message_id: int, delay: float = 5.0):
+    """Удаляет сообщение через delay секунд (не блокирует)."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def _send_long_message(bot, chat_id: int, text: str, parse_mode=None):
+    """Отправляет текст, разбивая на части по 4096 символов, если нужно."""
+    MAX_LEN = 4096
+    if len(text) <= MAX_LEN:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True,
+        )
+        return
+
+    while text:
+        if len(text) <= MAX_LEN:
+            chunk, text = text, ""
+        else:
+            split_at = text.rfind("\n", 0, MAX_LEN)
+            if split_at == -1:
+                split_at = MAX_LEN
+            chunk, text = text[:split_at], text[split_at:].lstrip("\n")
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True,
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок бота."""
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "\u26a0\ufe0f \u041f\u0440\u043e\u0438\u0437\u043e\u0448\u043b\u0430 \u043e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0438 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0435 \u0437\u0430\u043f\u0440\u043e\u0441\u0430. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0435\u0449\u0451 \u0440\u0430\u0437."
+            )
+        except Exception:
+            pass
+
+
 # -------------------- HANDLERS --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -727,16 +778,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.chat.send_action("typing")
 
         project_name = _get_project_name_by_chat(cid, title)
-        context_data = rag_engine.get_relevant_context(project_name, user_query) if project_name else None
+        context_data, source_files = (
+            rag_engine.get_relevant_context(project_name, user_query)
+            if project_name
+            else (None, [])
+        )
 
         res = await get_gpt_response(user_query, context=context_data)
 
-        await context.bot.send_message(
-            chat_id=cid,
-            text=res or "⚠️ Не удалось получить ответ",
-            parse_mode=None,
-            disable_web_page_preview=True,
-        )
+        # Отправляем ответ (длинные сообщения автоматически бьются на части)
+        await _send_long_message(context.bot, cid, res or "⚠️ Не удалось получить ответ")
+
+        # Отправляем исходные документы, из которых нашлась информация
+        for file_path in source_files:
+            try:
+                with open(file_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=cid,
+                        document=f,
+                        filename=os.path.basename(file_path),
+                        caption=f"📄 {os.path.basename(file_path)}",
+                    )
+            except Exception as e:
+                logger.error(f"Не удалось отправить документ {file_path}: {e}")
         return
 
     if cid in pending_progress:
@@ -803,10 +867,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_obj = None
     file_ext = ""
 
+    # Лимит Telegram Bot API на скачивание файла через getFile: 20 МБ
+    MAX_FILE_SIZE = 20 * 1024 * 1024
+
     if msg.photo:
         file_obj = await context.bot.get_file(msg.photo[-1].file_id)
         file_ext = ".jpg"
     elif msg.document:
+        if msg.document.file_size and msg.document.file_size > MAX_FILE_SIZE:
+            await msg.reply_text(
+                "⚠️ Файл слишком большой (более 20 МБ). "
+                "Telegram не позволяет боту скачивать файлы такого размера."
+            )
+            return
         file_obj = await context.bot.get_file(msg.document.file_id)
         if msg.document.file_name:
             _, ext = os.path.splitext(msg.document.file_name)
@@ -828,6 +901,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_title": chat_title,
         "config": target_cfg,
         "chat_id": chat_id,
+        "is_photo": bool(msg.photo),
     }
 
     systems = [COMMON_DOCS_BUTTON] + target_cfg["systems"]
@@ -861,13 +935,24 @@ async def handle_save_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     dest_path = save_file_to_system(d["local_path"], d["chat_title"], folder_name, d["filename"])
 
-    try:
-        await query.edit_message_text(
-            f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    if d.get("is_photo"):
+        # Для фото: пишем "сохранено" и автоматически удаляем через 5 секунд
+        msg_chat_id = query.message.chat_id
+        msg_id = query.message.message_id
+        try:
+            await query.edit_message_text("сохранено")
+        except Exception:
+            pass
+        asyncio.create_task(_delete_after_delay(context.bot, msg_chat_id, msg_id, delay=5))
+    else:
+        # Для документов: показываем полный путь
+        try:
+            await query.edit_message_text(
+                f"✅ Файл сохранён:\n<b>{chosen}</b>\n<code>{dest_path}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     # чистим temp
     if os.path.exists(d["local_path"]):
@@ -985,6 +1070,8 @@ def main():
 
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_error_handler(error_handler)
 
     _setup_jobs(app)
     app.run_polling()

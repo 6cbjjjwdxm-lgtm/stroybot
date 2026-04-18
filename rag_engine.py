@@ -46,43 +46,48 @@ def _project_index_path(project_name: str) -> str:
 
 def iter_pdf_documents(folder_path: str):
     """
-    Генератор документов: читает PDF рекурсивно и отдаёт Document по одному файлу.
-    Так мы не держим в RAM все тексты сразу.
+    Генератор документов: читает PDF рекурсивно и отдаёт Document по одной странице.
+    Метаданные содержат source, page, total_pages — используются в RAG-контексте.
     """
     if not os.path.exists(folder_path):
         return
 
     for root, _, files in os.walk(folder_path):
-        for filename in files:
+        for filename in sorted(files):
             if not filename.lower().endswith(".pdf"):
                 continue
 
             file_path = os.path.join(root, filename)
+            rel_source = os.path.relpath(file_path, folder_path)
 
             try:
-                text_parts = []
                 with pdfplumber.open(file_path) as pdf:
-                    for page in pdf.pages:
+                    total_pages = len(pdf.pages)
+                    has_text = False
+
+                    for page_num, page in enumerate(pdf.pages, start=1):
                         page_text = page.extract_text(layout=True)
-                        if page_text:
-                            text_parts.append(page_text)
 
                         try:
                             page.flush_cache()
                         except Exception:
                             pass
-                        try:
-                            page.get_text_layout.cache_clear()
-                        except Exception:
-                            pass
 
-                text = "\n".join(text_parts).strip()
-                if not text:
-                    logger.warning("PDF без извлекаемого текста (возможно скан): %s", file_path)
-                    continue
+                        if not page_text or not page_text.strip():
+                            continue
 
-                rel_source = os.path.relpath(file_path, folder_path)
-                yield Document(page_content=text, metadata={"source": rel_source})
+                        has_text = True
+                        yield Document(
+                            page_content=page_text.strip(),
+                            metadata={
+                                "source": rel_source,
+                                "page": page_num,
+                                "total_pages": total_pages,
+                            },
+                        )
+
+                    if not has_text:
+                        logger.warning("PDF без извлекаемого текста (возможно скан): %s", file_path)
 
             except Exception as e:
                 logger.error("Ошибка чтения PDF %s: %s", file_path, e)
@@ -90,8 +95,8 @@ def iter_pdf_documents(folder_path: str):
 
 def build_index_for_project(
     project_name: str,
-    chunk_size: int = 600,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,   # увеличено с 600: лучше сохраняет контекст
+    chunk_overlap: int = 150, # увеличено с 80: больше связность между чанками
     batch_size: int = 30,
 ):
     """
@@ -102,36 +107,44 @@ def build_index_for_project(
     docs_path = _project_docs_path(project_name)
     index_path = _project_index_path(project_name)
 
-    logger.info(f"🔄 Индексация проекта: {project_name} ({docs_path})")
+    logger.info("🔄 Индексация: %s (%s)", project_name, docs_path)
 
     if not os.path.exists(docs_path):
-        logger.warning(f"⚠️ Папка проекта не найдена: {docs_path}")
+        logger.warning("⚠️ Папка не найдена: %s", docs_path)
         return None
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
 
     vectorstore = None
     batch: list[Document] = []
     pdf_count = 0
     chunk_count = 0
+    seen_sources: set[str] = set()
 
     for doc in iter_pdf_documents(docs_path):
-        pdf_count += 1
+        src = doc.metadata.get("source", "")
+        if src not in seen_sources:
+            seen_sources.add(src)
+            pdf_count += 1
 
-        # Дробим по одному PDF -> чанки -> складываем в батч
         splits = splitter.split_documents([doc])
+        # Гарантируем, что source/page сохраняются в каждом чанке
         for s in splits:
+            s.metadata.setdefault("source", src)
             batch.append(s)
 
             if len(batch) >= batch_size:
                 if vectorstore is None:
                     vectorstore = FAISS.from_documents(documents=batch, embedding=EMBEDDINGS)
                 else:
-                    vectorstore.add_documents(documents=batch)  # добавление батчами [web:500]
+                    vectorstore.add_documents(documents=batch)
                 chunk_count += len(batch)
                 batch.clear()
 
-    # Догружаем остаток
     if batch:
         if vectorstore is None:
             vectorstore = FAISS.from_documents(documents=batch, embedding=EMBEDDINGS)
@@ -141,14 +154,14 @@ def build_index_for_project(
         batch.clear()
 
     if vectorstore is None:
-        logger.warning(f"⚠️ Индекс не построен: PDF={pdf_count}, chunks={chunk_count}")
+        logger.warning("⚠️ Индекс не построен: PDF=%d, chunks=%d", pdf_count, chunk_count)
         return None
 
     os.makedirs(index_path, exist_ok=True)
-    vectorstore.save_local(index_path)  # сохранение на диск [web:687]
+    vectorstore.save_local(index_path)
     VECTOR_STORES[project_name] = vectorstore
 
-    logger.info(f"✅ Индекс сохранён: {index_path} (PDF: {pdf_count}, chunks: {chunk_count})")
+    logger.info("✅ Индекс сохранён: %s (PDF: %d, chunks: %d)", index_path, pdf_count, chunk_count)
     return vectorstore
 
 
@@ -172,12 +185,16 @@ def load_index_if_exists(project_name: str):
         return None
 
 
-def get_relevant_context(project_name: str, query: str, k: int = 3):
+def get_relevant_context(project_name: str, query: str, k: int = 6, score_threshold: float = 0.35):
     """
-    Возвращает (context_str, source_files) где:
-      - context_str — склейка top-k чанков для промпта (или None)
-      - source_files — список полных путей к найденным PDF-файлам
-    Если индекс не загружен и нет сохранённого — строит.
+    Усиленный RAG-поиск. Возвращает (context_str, source_files).
+
+    Алгоритм:
+      1. MMR (Maximal Marginal Relevance): выбирает k=6 разнообразных релевантных фрагментов
+         из 20 кандидатов (lambda=0.7: 70% релевантность + 30% разнообразие).
+      2. Fallback: similarity_search_with_relevance_scores + фильтр по порогу.
+
+    Контекст содержит номер страницы и название документа.
     """
     if not project_name:
         return None, []
@@ -188,7 +205,27 @@ def get_relevant_context(project_name: str, query: str, k: int = 3):
                 return None, []
 
     index = VECTOR_STORES[project_name]
-    results = index.similarity_search(query, k=k)
+    results: list[Document] = []
+
+    # ── Шаг 1: MMR ──
+    try:
+        results = index.max_marginal_relevance_search(
+            query,
+            k=k,
+            fetch_k=max(k * 4, 20),
+            lambda_mult=0.7,
+        )
+    except Exception as exc:
+        logger.warning("MMR недоступен (%s), fallback → similarity_search", exc)
+
+    # ── Шаг 2: Fallback ──
+    if not results:
+        try:
+            scored = index.similarity_search_with_relevance_scores(query, k=k + 4)
+            results = [doc for doc, score in scored if score >= score_threshold][:k]
+        except Exception:
+            results = index.similarity_search(query, k=k)
+
     if not results:
         return None, []
 
@@ -199,8 +236,9 @@ def get_relevant_context(project_name: str, query: str, k: int = 3):
 
     for doc in results:
         source = doc.metadata.get("source", "unknown")
+        page = doc.metadata.get("page", "?")
         context_parts.append(
-            f"--- ИЗ ДОКУМЕНТА: {source} ---\n{doc.page_content}"
+            f"——— [{source}] стр. {page} ———\n{doc.page_content}"
         )
         if source != "unknown" and source not in seen_sources:
             seen_sources.append(source)
